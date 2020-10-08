@@ -4,14 +4,11 @@ var fs = require('fs');
 var os = require('os');
 var path = require('path');
 var util = require('util');
-var semver = require('semver');
 var zlib = require('zlib');
 var hash = require('object-hash');
-var winston = require('winston');
-var compat = require('winston-compat');
 var MESSAGE = require('triple-beam').MESSAGE;
 var PassThrough = require('stream').PassThrough;
-var Transport = semver.major(winston.version) === 2 ? compat.Transport : require('winston-transport');
+var Transport = require('winston-transport');
 
 var loggerDefaults = {
     json: false,
@@ -50,6 +47,7 @@ var DailyRotateFile = function (options) {
             var sizeK = Math.round(size / 1024);
             return sizeK === 0 ? '1k' : sizeK + 'k';
         }
+
         return null;
     }
 
@@ -88,11 +86,40 @@ var DailyRotateFile = function (options) {
             max_logs: options.maxFiles,
             end_stream: true,
             audit_file: options.auditFile ? options.auditFile : path.join(self.dirname, '.' + hash(options) + '-audit.json'),
-            file_options: options.options ? options.options : {flags: 'a'}
+            file_options: options.options ? options.options : {flags: 'a'},
+            utc: options.utc ? options.utc : false,
+            extension: options.extension ? options.extension : '',
+            create_symlink: options.createSymlink ? options.createSymlink : false,
+            symlink_name: options.symlinkName ? options.symlinkName : 'current.log'
+        });
+
+        this.logStream.on('new', function (newFile) {
+            self.emit('new', newFile);
         });
 
         this.logStream.on('rotate', function (oldFile, newFile) {
             self.emit('rotate', oldFile, newFile);
+        });
+
+        this.logStream.on('logRemoved', function (params) {
+            if (options.zippedArchive) {
+                var gzName = params.name + '.gz';
+                if (fs.existsSync(gzName)) {
+                    try {
+                        fs.unlinkSync(gzName);
+                    }
+                    catch (_err) {
+                        // file is there but we got an error when trying to delete,
+                        // so permissions problem or concurrency issue and another
+                        // process already deleted it we could detect the concurrency
+                        // issue by checking err.type === ENOENT or EACCESS for
+                        // permissions ... but then?
+                    }
+                    self.emit('logRemoved', gzName);
+                    return;
+                }
+            }
+            self.emit('logRemoved', params.name);
         });
 
         if (options.zippedArchive) {
@@ -102,11 +129,14 @@ var DailyRotateFile = function (options) {
                 if (!oldFileExist || gzExist) {
                     return;
                 }
+
                 var gzip = zlib.createGzip();
                 var inp = fs.createReadStream(oldFile);
                 var out = fs.createWriteStream(oldFile + '.gz');
                 inp.pipe(gzip).pipe(out).on('finish', function () {
-                    fs.unlinkSync(oldFile);
+                    if (fs.existsSync(oldFile)) {
+                        fs.unlinkSync(oldFile);
+                    }
                     self.emit('archive', oldFile + '.gz');
                 });
             });
@@ -121,29 +151,13 @@ util.inherits(DailyRotateFile, Transport);
 DailyRotateFile.prototype.name = 'dailyRotateFile';
 
 var noop = function () {};
-if (semver.major(winston.version) === 2) {
-    DailyRotateFile.prototype.log = function (level, msg, meta, callback) {
-        callback = callback || noop;
-        var options = Object.assign({}, this.options, {
-            level: level,
-            message: msg,
-            meta: meta
-        });
+DailyRotateFile.prototype.log = function (info, callback) {
+    callback = callback || noop;
 
-        var output = compat.log(options) + options.eol;
-        this.logStream.write(output);
-        callback(null, true);
-    };
-} else {
-    DailyRotateFile.prototype.normalizeQuery = compat.Transport.prototype.normalizeQuery;
-    DailyRotateFile.prototype.log = function (info, callback) {
-        callback = callback || noop;
-
-        this.logStream.write(info[MESSAGE] + this.options.eol);
-        this.emit('logged', info);
-        callback(null, true);
-    };
-}
+    this.logStream.write(info[MESSAGE] + this.options.eol);
+    this.emit('logged', info);
+    callback(null, true);
+};
 
 DailyRotateFile.prototype.close = function () {
     var self = this;
@@ -170,7 +184,28 @@ DailyRotateFile.prototype.query = function (options, callback) {
 
     var self = this;
     var results = [];
-    options = self.normalizeQuery(options);
+    options = options || {};
+
+    // limit
+    options.rows = options.rows || options.limit || 10;
+
+    // starting row offset
+    options.start = options.start || 0;
+
+    // now
+    options.until = options.until || new Date;
+    if (typeof options.until !== 'object') {
+        options.until = new Date(options.until);
+    }
+
+    // now - 24
+    options.from = options.from || (options.until - (24 * 60 * 60 * 1000));
+    if (typeof options.from !== 'object') {
+        options.from = new Date(options.from);
+    }
+
+    // 'asc' or 'desc'
+    options.order = options.order || 'desc';
 
     var logFiles = (function () {
         var fileRegex = new RegExp(self.filename.replace('%DATE%', '.*'), 'i');
@@ -187,6 +222,7 @@ DailyRotateFile.prototype.query = function (options, callback) {
         if (!file) {
             return;
         }
+
         var logFile = path.join(self.dirname, file);
         var buff = '';
 
@@ -205,9 +241,11 @@ DailyRotateFile.prototype.query = function (options, callback) {
             if (stream.readable) {
                 stream.destroy();
             }
+
             if (!callback) {
                 return;
             }
+
             return err.code === 'ENOENT' ? callback(null, results) : callback(err);
         });
 
@@ -255,6 +293,7 @@ DailyRotateFile.prototype.query = function (options, callback) {
                         return obj;
                     });
                 }
+
                 callback(null, results);
             }
         });
@@ -267,7 +306,9 @@ DailyRotateFile.prototype.query = function (options, callback) {
                 }
 
                 var time = new Date(log.timestamp);
-                if ((options.from && time < options.from) || (options.until && time > options.until)) {
+                if ((options.from && time < options.from) ||
+                    (options.until && time > options.until) ||
+                    (options.level && options.level !== log.level)) {
                     return;
                 }
 
